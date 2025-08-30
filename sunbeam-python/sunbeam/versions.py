@@ -25,6 +25,14 @@ K8S_CHANNEL = "1.32/stable"
 LXD_CHANNEL = "5.21/stable"
 SUNBEAM_EPA_ORCHESTRATOR_CHANNEL = "2024.1/edge"
 
+CLUSTER_API_VERSIONS = {
+    "cluster-api": "v1.10.5",
+    "bootstrap-canonical-kubernetes": "v0.4.2",
+    "control-plane-canonical-kubernetes": "v0.4.2",
+    "infrastructure-openstack": "v0.12.4",
+    "addon-helm": "v0.3.2",
+}
+
 # List of charms with default channels
 OPENSTACK_CHARMS_K8S = {
     "cinder-k8s": OPENSTACK_CHANNEL,

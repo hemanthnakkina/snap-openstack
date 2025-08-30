@@ -141,6 +141,32 @@ class K8SHelper:
         """Return internal pool name."""
         return METALLB_INTERNAL_POOL_NAME
 
+    @classmethod
+    def get_provider_resource(
+        cls,
+    ) -> Type["l_generic_resource.GenericNamespacedResource"]:
+        """Return lighkube generic resource of type provider."""
+        return l_generic_resource.create_namespaced_resource(
+            "clusterctl.cluster.x-k8s.io",
+            "v1alpha3",
+            "Provider",
+            "providers",
+            verbs=["delete", "get", "list", "patch", "post", "put", "global_list"],
+        )
+
+    @classmethod
+    def get_cluster_resource(
+        cls,
+    ) -> Type["l_generic_resource.GenericNamespacedResource"]:
+        """Return lighkube generic resource of type cluster."""
+        return l_generic_resource.create_namespaced_resource(
+            "cluster.x-k8s.io",
+            "v1beta1",
+            "cluster",
+            "clusters",
+            verbs=["delete", "get", "list", "patch", "post", "put", "global_list"],
+        )
+
 
 def find_node(client: "l_client.Client", name: str) -> "core_v1.Node":
     """Find a node by name."""
