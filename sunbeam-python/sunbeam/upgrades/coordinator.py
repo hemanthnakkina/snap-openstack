@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import typing
 from dataclasses import dataclass
 from enum import Enum
@@ -35,6 +36,7 @@ from sunbeam.clusterd.models import AcquireUpgradeLockResponse
 from sunbeam.clusterd.service import UpgradeTokenMismatchException
 from sunbeam.upgrades.errors import UpgradeErrorCode
 from sunbeam.upgrades.metadata import HopMetadata, load_upgrade_metadata
+from sunbeam.upgrades.observability import UpgradeLogger
 from sunbeam.upgrades.state import (
     Hop,
     HopStatus,
@@ -152,11 +154,14 @@ class ReleaseUpgradeCoordinator:
     status in_progress are treated as failed and re-run from scratch.
     """
 
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, logger: UpgradeLogger | None = None):
         self.client = client
         self._token: int | None = None
         self._state: UpgradeState | None = None
         self._metadata: HopMetadata | None = None
+        self.logger = logger or UpgradeLogger()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_stop = threading.Event()
 
     @property
     def token(self) -> int | None:
@@ -176,6 +181,9 @@ class ReleaseUpgradeCoordinator:
     def acquire_lock(self, holder_id: str | None = None) -> int:
         """Acquire the advisory lock. Returns the fencing token.
 
+        Starts a background heartbeat thread that refreshes the lock's
+        TTL every 30 seconds (TTL is 60s in clusterd).
+
         :param holder_id: identifies the process. Defaults to hostname+pid.
         :raises UpgradeLockHeldException: if another live holder owns it.
         """
@@ -186,7 +194,33 @@ class ReleaseUpgradeCoordinator:
         )
         self._token = response.token
         LOG.info("acquired upgrade lock (token=%d, holder=%s)", self._token, holder_id)
+        self.logger.log_lock_event("acquired", self._token, holder_id)
+        self._start_heartbeat()
         return self._token
+
+    def _start_heartbeat(self) -> None:
+        """Start the background heartbeat thread."""
+        self._heartbeat_stop.clear()
+
+        def _beat() -> None:
+            while not self._heartbeat_stop.wait(30):
+                try:
+                    self.refresh_lock()
+                except Exception as e:
+                    LOG.warning("lock heartbeat failed: %s", e)
+                    break
+
+        self._heartbeat_thread = threading.Thread(
+            target=_beat, daemon=True, name="upgrade-lock-heartbeat"
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        """Stop the background heartbeat thread."""
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=5)
+            self._heartbeat_thread = None
 
     def refresh_lock(self) -> None:
         """Extend the lock's TTL. Called by the heartbeat loop.
@@ -196,18 +230,22 @@ class ReleaseUpgradeCoordinator:
         if self._token is None:
             raise RuntimeError("no lock held")
         self.client.cluster.refresh_upgrade_lock(self._token)
+        self.logger.log_lock_event("refreshed", self._token)
 
     def release_lock(self) -> None:
         """Release the lock. Safe to call even if already released."""
+        self._stop_heartbeat()
         if self._token is not None:
             try:
                 self.client.cluster.release_upgrade_lock(self._token)
                 LOG.info("released upgrade lock (token=%d)", self._token)
+                self.logger.log_lock_event("released", self._token)
             except UpgradeTokenMismatchException:
                 LOG.warning(
                     "lock token %d is stale — already re-acquired by another process",
                     self._token,
                 )
+                self.logger.log_lock_event("stale", self._token)
             finally:
                 self._token = None
 
@@ -393,12 +431,22 @@ class ReleaseUpgradeCoordinator:
         phase_obj = getattr(hop.phases, phase_name.value)
         self._transition_phase(phase_obj, PhaseStatus.IN_PROGRESS)
         hop.phase = phase_name.value
+        self.logger.log_state_change(
+            "phase", phase_name.value, "phase_started", "in_progress"
+        )
         self.persist_state()
 
         try:
             result = handler.run(self, self._metadata, self._state)
         except Exception as e:
             LOG.exception("phase %s raised: %s", phase_name.value, e)
+            self.logger.log_state_change(
+                "phase",
+                phase_name.value,
+                "phase_exception",
+                "failed",
+                error_message=str(e),
+            )
             result = PhaseResult(
                 success=False,
                 error_code=UpgradeErrorCode.HOP_INVALID_TRANSITION,
@@ -407,8 +455,19 @@ class ReleaseUpgradeCoordinator:
 
         if result.success:
             self._transition_phase(phase_obj, PhaseStatus.COMPLETED)
+            self.logger.log_state_change(
+                "phase", phase_name.value, "phase_completed", "completed"
+            )
         else:
             self._transition_phase(phase_obj, PhaseStatus.FAILED)
+            self.logger.log_state_change(
+                "phase",
+                phase_name.value,
+                "phase_failed",
+                "failed",
+                error_code=result.error_code.value if result.error_code else None,
+                error_message=result.error_message,
+            )
             if result.error_code:
                 phase_obj.last_error = LastError(
                     code=result.error_code.value,
@@ -462,5 +521,6 @@ class ReleaseUpgradeCoordinator:
 
         self._transition_hop(hop, HopStatus.ABANDONED)
         self.persist_state()
+        self.logger.log_state_change("hop", "active_hop", "hop_abandoned", "abandoned")
         self.release_lock()
         LOG.info("hop abandoned")
