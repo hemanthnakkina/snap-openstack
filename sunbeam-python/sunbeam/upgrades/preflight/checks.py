@@ -173,6 +173,14 @@ class HopMetadataCheck(UpgradeCheck):
 
     def run(self, check_status: Status | None = None) -> bool:
         """Return False if hop is invalid or metadata is missing/incompatible."""
+        if self.ctx.from_release == self.ctx.to_release:
+            self.message = (
+                f"Source and target releases are both "
+                f"{self.ctx.to_release!r}. The snap must be refreshed to the "
+                "target release before running the upgrade: "
+                "'sudo snap refresh openstack --channel=<target>/stable'."
+            )
+            return False
         if not is_valid_hop(self.ctx.from_release, self.ctx.to_release):
             self.message = (
                 f"Hop {self.ctx.from_release} -> {self.ctx.to_release} is "
