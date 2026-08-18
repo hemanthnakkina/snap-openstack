@@ -165,6 +165,187 @@ class ControlPlaneHandler:
 
         return PhaseResult(success=True)
 
+    def plan_group(
+        self,
+        group_meta: typing.Any,
+    ) -> list[dict]:
+        """Run terraform plan for a single group and return change events.
+
+        Updates tfvars for the group's charms and runs ``terraform plan``
+        without applying. Does not modify clusterd state.
+
+        Runs both JSON and text plan: JSON events are returned for
+        user-facing display; text output is logged at debug level for
+        human-readable ``+``/``-`` diff in the sunbeam log file.
+
+        :param group_meta: ControlPlaneGroup metadata for the group
+        :returns: list of terraform plan JSON events
+        :raises TerraformException: if the plan command fails
+        """
+        client = self.deployment.get_client()
+        charms = group_meta.apps
+        target_args = _terraform_targets_for_charms(
+            charms, group_meta.terraform_targets
+        )
+
+        events = self.tfhelper.update_partial_tfvars_and_plan_tf(
+            client,
+            self.manifest,
+            charms,
+            OPENSTACK_CONFIG_KEY,
+            tf_plan_extra_args=target_args,
+        )
+
+        # Run text plan for debug logging (tfvars already written above)
+        try:
+            plan_text = self.tfhelper.terraform_plan_text(extra_args=target_args)
+            LOG.debug(
+                "Terraform plan (text) for group %s:\n%s",
+                group_meta.name,
+                plan_text,
+            )
+        except TerraformException as e:
+            LOG.warning(
+                "Terraform text plan failed for group %s: %s",
+                group_meta.name,
+                e,
+            )
+
+        return events
+
+    def run_group(
+        self,
+        coordinator: ReleaseUpgradeCoordinator,
+        metadata: HopMetadata | None,
+        group_name: str,
+    ) -> PhaseResult:
+        """Upgrade a single group by name.
+
+        Does not skip completed groups — use run() for resume behavior.
+        """
+        if metadata is None:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.METADATA_MISSING,
+                error_message="No metadata loaded",
+            )
+
+        hop = coordinator.get_current_hop()
+        if hop is None:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.HOP_INVALID_TRANSITION,
+                error_message="No active hop",
+            )
+
+        group_meta = None
+        for g in metadata.control_plane_groups:
+            if g.name == group_name:
+                group_meta = g
+                break
+        if group_meta is None:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.METADATA_INVALID,
+                error_message=f"Group {group_name} not found in metadata",
+            )
+
+        control_plane = hop.phases.control_plane
+        group_state = control_plane.groups.get(group_name)
+        if group_state is None:
+            group_state = Group()
+            control_plane.groups[group_name] = group_state
+
+        group_state.status = PhaseStatus.IN_PROGRESS
+        group_state.started_at = _now_iso()
+        coordinator.persist_state()
+
+        result = self._upgrade_group(group_meta, group_name)
+        if result.success:
+            group_state.status = PhaseStatus.COMPLETED
+            group_state.completed_at = _now_iso()
+        else:
+            group_state.status = PhaseStatus.FAILED
+            group_state.last_error = LastError(
+                code=result.error_code.value if result.error_code else "",
+                message=result.error_message or "",
+            )
+        coordinator.persist_state()
+        return result
+
+    def run_application(
+        self,
+        coordinator: ReleaseUpgradeCoordinator,
+        metadata: HopMetadata | None,
+        app_name: str,
+    ) -> PhaseResult:
+        """Upgrade a single application via scoped terraform apply.
+
+        Does not run pre/post actions (those are group-level).
+        """
+        if metadata is None:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.METADATA_MISSING,
+                error_message="No metadata loaded",
+            )
+
+        hop = coordinator.get_current_hop()
+        if hop is None:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.HOP_INVALID_TRANSITION,
+                error_message="No active hop",
+            )
+
+        # Verify the app exists in some group
+        group_meta = None
+        for g in metadata.control_plane_groups:
+            if app_name in g.apps:
+                group_meta = g
+                break
+        if group_meta is None:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.METADATA_INVALID,
+                error_message=f"Application {app_name} not found in any group",
+            )
+
+        client = self.deployment.get_client()
+        target_args = _terraform_targets_for_charms(
+            [app_name], group_meta.terraform_targets
+        )
+        try:
+            self.tfhelper.update_partial_tfvars_and_apply_tf(
+                client,
+                self.manifest,
+                [app_name],
+                OPENSTACK_CONFIG_KEY,
+                tf_apply_extra_args=target_args,
+            )
+        except TerraformException as e:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.CONTROL_PLANE_APPLY_FAILED,
+                error_message=f"Terraform apply failed for {app_name}: {e}",
+            )
+
+        try:
+            self.jhelper.wait_until_desired_status(
+                OPENSTACK_MODEL,
+                [app_name],
+                status=["active"],
+                timeout=600,
+            )
+        except (JujuWaitException, TimeoutError) as e:
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.CONTROL_PLANE_CONVERGENCE_TIMEOUT,
+                error_message=f"{app_name} did not converge: {e}",
+            )
+
+        return PhaseResult(success=True)
+
     def _upgrade_group(
         self,
         group_meta: typing.Any,

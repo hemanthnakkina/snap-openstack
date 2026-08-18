@@ -97,7 +97,9 @@ control_plane_groups:
         apps: [nova-k8s]
         scope: leader
     terraform_targets:
-      nova-k8s: [module.nova]
+      nova-k8s:
+        - module.nova
+        - juju_integration.nova-to-ingress-metadata
     post_actions:
       - action: post-upgrade
         apps: [nova-k8s]
