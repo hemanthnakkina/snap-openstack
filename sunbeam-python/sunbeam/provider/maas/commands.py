@@ -210,6 +210,7 @@ from sunbeam.steps.terraform import CleanTerraformPlansStep
 from sunbeam.utils import (
     CatchGroup,
     DefaultableMappingParameter,
+    GuardedGroup,
     click_option_show_hints,
 )
 
@@ -217,7 +218,7 @@ LOG = logging.getLogger(__name__)
 console = Console()
 
 
-@click.group("cluster", context_settings=CONTEXT_SETTINGS, cls=CatchGroup)
+@click.group("cluster", context_settings=CONTEXT_SETTINGS, cls=GuardedGroup)
 @click.pass_context
 def cluster(ctx):
     """Manage the Sunbeam Cluster."""

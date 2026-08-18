@@ -198,7 +198,7 @@ from sunbeam.steps.sunbeam_machine import (
 )
 from sunbeam.steps.sync_feature_gates import SyncFeatureGatesToCluster
 from sunbeam.utils import (
-    CatchGroup,
+    GuardedGroup,
     click_option_show_hints,
 )
 
@@ -208,7 +208,7 @@ DEPLOYMENTS_CONFIG_KEY = "deployments"
 DEFAULT_LXD_CLOUD = "localhost"
 
 
-@click.group("cluster", context_settings=CONTEXT_SETTINGS, cls=CatchGroup)
+@click.group("cluster", context_settings=CONTEXT_SETTINGS, cls=GuardedGroup)
 @click.pass_context
 def cluster(ctx):
     """Manage the Sunbeam Cluster."""
