@@ -520,6 +520,7 @@ class ReleaseUpgradeCoordinator:
             raise RuntimeError("no active hop to abandon")
 
         self._transition_hop(hop, HopStatus.ABANDONED)
+        self._state.active_hop.hop_history_index = None
         self.persist_state()
         self.logger.log_state_change("hop", "active_hop", "hop_abandoned", "abandoned")
         self.release_lock()

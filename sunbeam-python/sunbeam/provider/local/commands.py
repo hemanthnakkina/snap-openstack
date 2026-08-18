@@ -20,6 +20,7 @@ from sunbeam.clusterd.service import (
 )
 from sunbeam.commands import refresh as refresh_cmds
 from sunbeam.commands import resize as resize_cmds
+from sunbeam.commands import upgrade as upgrade_cmds
 from sunbeam.commands.configure import (
     DemoSetup,
     TerraformDemoInitStep,
@@ -246,6 +247,7 @@ class LocalProvider(ProviderBase):
         cluster.add_command(remove)
         cluster.add_command(resize_cmds.resize)
         cluster.add_command(refresh_cmds.refresh)
+        cluster.add_command(upgrade_cmds.upgrade)
 
     def deployment_type(self) -> Tuple[str, Type[Deployment]]:
         """Retrieve the deployment type and class."""

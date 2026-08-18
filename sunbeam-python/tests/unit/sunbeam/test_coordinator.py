@@ -346,8 +346,9 @@ class TestAbandon:
         coordinator.create_hop("2025.1", "2026.1", "rev-100")
 
         coordinator.abandon()
-        hop = coordinator.get_current_hop()
+        hop = coordinator.state.hop_history[0]
         assert hop.status == HopStatus.ABANDONED
+        assert coordinator.state.active_hop.hop_history_index is None
         assert coordinator.token is None
 
     def test_abandon_without_hop_raises(self, coordinator, mock_client):
