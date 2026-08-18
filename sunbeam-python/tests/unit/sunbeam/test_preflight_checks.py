@@ -9,6 +9,7 @@ import pytest
 
 from sunbeam.clusterd.models import FeatureGates
 from sunbeam.upgrades.metadata import HopMetadata
+from sunbeam.upgrades.preflight.capacity import CapacityCheck
 from sunbeam.upgrades.preflight.checks import (
     CheckContext,
     ClusterHealthCheck,
@@ -304,20 +305,26 @@ class TestMySQLQuorumCheck:
 
 
 class TestBuildPreflightChecks:
-    def test_returns_four_checks_in_order(self, ctx):
+    def test_returns_five_checks_in_order(self, ctx):
         checks = build_preflight_checks(ctx)
-        assert len(checks) == 4
+        assert len(checks) == 5
         names = [type(c).__name__ for c in checks]
         assert names == [
             "SnapVersionCheck",
             "HopMetadataCheck",
             "ClusterHealthCheck",
+            "CapacityCheck",
             "MySQLQuorumCheck",
         ]
 
     def test_all_checks_carry_exit_code(self, ctx):
         for check in build_preflight_checks(ctx):
             assert check.exit_code in (1, 2), f"{type(check).__name__} has no exit_code"
+
+    def test_capacity_override_flag(self, ctx):
+        checks = build_preflight_checks(ctx, capacity_override=True)
+        capacity_check = next(c for c in checks if isinstance(c, CapacityCheck))
+        assert capacity_check.override is True
 
 
 # ---------------------------------------------------------------------------

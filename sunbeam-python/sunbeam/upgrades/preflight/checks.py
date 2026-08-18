@@ -309,15 +309,23 @@ class MySQLQuorumCheck(UpgradeCheck):
         return True
 
 
-def build_preflight_checks(ctx: CheckContext) -> list[Check]:
+def build_preflight_checks(
+    ctx: CheckContext, capacity_override: bool = False
+) -> list[Check]:
     """Construct the ordered list of preflight checks.
 
     Order matters: cheap static checks run first (fail fast on a
     stale snap or invalid hop before touching Juju/MySQL).
+
+    :param capacity_override: skip the capacity check (for
+        --capacity-policy-override CLI flag).
     """
+    from sunbeam.upgrades.preflight.capacity import CapacityCheck
+
     return [
         SnapVersionCheck(ctx),
         HopMetadataCheck(ctx),
         ClusterHealthCheck(ctx),
+        CapacityCheck(ctx, override=capacity_override),
         MySQLQuorumCheck(ctx),
     ]
