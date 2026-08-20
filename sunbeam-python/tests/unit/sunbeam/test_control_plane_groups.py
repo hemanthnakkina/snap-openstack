@@ -157,6 +157,20 @@ class TestControlPlaneHandler:
         tfhelper = mock_deployment.get_tfhelper.return_value
         assert tfhelper.update_partial_tfvars_and_apply_tf.call_count == 2
 
+    def test_terraform_init_runs_before_apply_per_group(
+        self, mock_deployment, coordinator
+    ):
+        metadata = _make_metadata()
+        state = coordinator.state
+        handler = ControlPlaneHandler(mock_deployment)
+
+        handler.run(coordinator, metadata, state)
+
+        tfhelper = mock_deployment.get_tfhelper.return_value
+        assert tfhelper.init.call_count == 2
+        names = [c[0] for c in tfhelper.method_calls]
+        assert names.index("init") < names.index("update_partial_tfvars_and_apply_tf")
+
     def test_convergence_wait_called_per_group(self, mock_deployment, coordinator):
         metadata = _make_metadata()
         state = coordinator.state

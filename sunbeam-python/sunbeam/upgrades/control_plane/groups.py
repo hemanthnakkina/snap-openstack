@@ -188,6 +188,7 @@ class ControlPlaneHandler:
             charms, group_meta.terraform_targets
         )
 
+        self.tfhelper.init()
         events = self.tfhelper.update_partial_tfvars_and_plan_tf(
             client,
             self.manifest,
@@ -316,6 +317,7 @@ class ControlPlaneHandler:
             [app_name], group_meta.terraform_targets
         )
         try:
+            self.tfhelper.init()
             self.tfhelper.update_partial_tfvars_and_apply_tf(
                 client,
                 self.manifest,
@@ -327,7 +329,7 @@ class ControlPlaneHandler:
             return PhaseResult(
                 success=False,
                 error_code=UpgradeErrorCode.CONTROL_PLANE_APPLY_FAILED,
-                error_message=f"Terraform apply failed for {app_name}: {e}",
+                error_message=f"Terraform init/apply failed for {app_name}: {e}",
             )
 
         try:
@@ -378,6 +380,10 @@ class ControlPlaneHandler:
         )
 
         try:
+            # ponytail: init re-resolves providers from the snap mirror; a snap
+            # refresh can bump the juju provider version, leaving the .terraform
+            # dir stale and apply failing with "unavailable provider".
+            self.tfhelper.init()
             self.tfhelper.update_partial_tfvars_and_apply_tf(
                 client,
                 self.manifest,
@@ -391,7 +397,7 @@ class ControlPlaneHandler:
             return PhaseResult(
                 success=False,
                 error_code=UpgradeErrorCode.CONTROL_PLANE_APPLY_FAILED,
-                error_message=f"Terraform apply failed for group {group_name}: {e}",
+                error_message=f"Terraform init/apply failed for {group_name}: {e}",
             )
 
         try:
