@@ -18,9 +18,14 @@ import datetime
 import logging
 import typing
 
+import click
+import yaml
+from rich.console import Console
+
+from sunbeam.core.common import RiskLevel, infer_risk
 from sunbeam.core.deployment import Deployment
 from sunbeam.core.juju import JujuHelper, JujuWaitException
-from sunbeam.core.manifest import Manifest
+from sunbeam.core.manifest import Manifest, embedded_manifest_path
 from sunbeam.core.openstack import OPENSTACK_MODEL
 from sunbeam.core.terraform import TerraformException, TerraformHelper
 from sunbeam.steps.openstack import CONFIG_KEY as OPENSTACK_CONFIG_KEY
@@ -37,10 +42,39 @@ from sunbeam.upgrades.metadata import HopMetadata
 from sunbeam.upgrades.state import Group, LastError, PhaseStatus, UpgradeState
 
 LOG = logging.getLogger(__name__)
+console = Console()
 
 
 def _now_iso() -> str:
     return datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+
+
+def _load_target_charm_manifests(to_release: str) -> dict[str, dict]:
+    """Load per-charm manifest entries from the snap's embedded target manifest.
+
+    Reads ``etc/manifests/<to_release>/<risk>.yml`` from the snap and
+    returns a mapping of charm name to its raw manifest dict (channel,
+    revision, config, resources — whatever the embedded manifest carries).
+
+    :param to_release: target release, e.g. "2026.1"
+    :returns: charm name -> raw manifest dict, or empty dict if not found
+    """
+    from snaphelpers import Snap
+
+    try:
+        snap = Snap()
+        risk = infer_risk(snap)
+        if risk == RiskLevel.STABLE:
+            risk_str = "stable"
+        else:
+            risk_str = str(risk)
+        path = embedded_manifest_path(snap, to_release, risk_str)
+        data = yaml.safe_load(path.read_text())
+        charms = data.get("core", {}).get("software", {}).get("charms", {})
+        return dict(charms.items())
+    except Exception as e:
+        LOG.warning("Could not load target manifest for %s: %s", to_release, e)
+        return {}
 
 
 def _terraform_targets_for_charms(
@@ -75,11 +109,13 @@ class ControlPlaneHandler:
     Implements the PhaseHandler protocol.
     """
 
-    def __init__(self, deployment: Deployment):
+    def __init__(self, deployment: Deployment, to_release: str = ""):
         self.deployment = deployment
+        self.to_release = to_release
         self._tfhelper: TerraformHelper | None = None
         self._manifest: Manifest | None = None
         self._jhelper: JujuHelper | None = None
+        self._target_channels: dict[str, dict] | None = None
 
     @property
     def tfhelper(self) -> TerraformHelper:
@@ -101,6 +137,41 @@ class ControlPlaneHandler:
         if self._jhelper is None:
             self._jhelper = self.deployment.get_juju_helper()
         return self._jhelper
+
+    @property
+    def target_charms(self) -> dict[str, dict]:
+        """Per-charm manifest entries from the snap's embedded target manifest."""
+        if self._target_channels is None:
+            self._target_channels = _load_target_charm_manifests(self.to_release)
+        return self._target_channels
+
+    def _override_charm_manifests(self, charms: list[str]) -> None:
+        """Override manifest entries for the group's charms from the target release.
+
+        Replaces the full CharmManifest (channel, revision, config, resources)
+        for the group's charms with values from the snap's embedded target
+        manifest. Other charms keep their current (clusterd) values.
+        """
+        if not self.to_release:
+            return
+        from sunbeam.core.manifest import CharmManifest
+
+        for charm in charms:
+            target_cfg = self.target_charms.get(charm)
+            if target_cfg and charm in self.manifest.core.software.charms:
+                old = self.manifest.core.software.charms[charm].channel
+                self.manifest.core.software.charms[charm] = CharmManifest(**target_cfg)
+                LOG.info(
+                    "overrode %s channel: %s -> %s",
+                    charm,
+                    old,
+                    target_cfg.get("channel"),
+                )
+            elif target_cfg:
+                LOG.warning(
+                    "charm %s not in deployment manifest, skipping override",
+                    charm,
+                )
 
     def run(
         self,
@@ -188,6 +259,7 @@ class ControlPlaneHandler:
             charms, group_meta.terraform_targets
         )
 
+        self._override_charm_manifests(charms)
         self.tfhelper.init()
         events = self.tfhelper.update_partial_tfvars_and_plan_tf(
             client,
@@ -278,11 +350,14 @@ class ControlPlaneHandler:
         self,
         coordinator: ReleaseUpgradeCoordinator,
         metadata: HopMetadata | None,
-        app_name: str,
+        charm_name: str,
     ) -> PhaseResult:
         """Upgrade a single application via scoped terraform apply.
 
         Does not run pre/post actions (those are group-level).
+
+        :param charm_name: charm name (e.g. 'placement-k8s'), resolved
+            from the juju app name by the CLI.
         """
         if metadata is None:
             return PhaseResult(
@@ -299,52 +374,88 @@ class ControlPlaneHandler:
                 error_message="No active hop",
             )
 
-        # Verify the app exists in some group
+        # Verify the charm exists in some group
         group_meta = None
         for g in metadata.control_plane_groups:
-            if app_name in g.apps:
+            if charm_name in g.apps:
                 group_meta = g
                 break
         if group_meta is None:
             return PhaseResult(
                 success=False,
                 error_code=UpgradeErrorCode.METADATA_INVALID,
-                error_message=f"Application {app_name} not found in any group",
+                error_message=f"Charm {charm_name} not found in any group",
             )
+
+        # Mark group as in_progress (single-app upgrade doesn't complete the group)
+        control_plane = hop.phases.control_plane
+        group_state = control_plane.groups.get(group_meta.name)
+        if group_state is None:
+            group_state = Group()
+            control_plane.groups[group_meta.name] = group_state
+        if group_state.status != PhaseStatus.COMPLETED:
+            group_state.status = PhaseStatus.IN_PROGRESS
+            group_state.started_at = _now_iso()
+            coordinator.persist_state()
 
         client = self.deployment.get_client()
         target_args = _terraform_targets_for_charms(
-            [app_name], group_meta.terraform_targets
+            [charm_name], group_meta.terraform_targets
         )
-        try:
-            self.tfhelper.init()
-            self.tfhelper.update_partial_tfvars_and_apply_tf(
-                client,
-                self.manifest,
-                [app_name],
-                OPENSTACK_CONFIG_KEY,
-                tf_apply_extra_args=target_args,
-            )
-        except TerraformException as e:
+        self._override_charm_manifests([charm_name])
+
+        # Resolve charm name to deployed juju app name for Juju operations
+        status = self.jhelper.get_model_status(OPENSTACK_MODEL)
+        juju_app_names = [
+            name for name, app in status.apps.items() if app.charm == charm_name
+        ]
+        if not juju_app_names:
             return PhaseResult(
                 success=False,
-                error_code=UpgradeErrorCode.CONTROL_PLANE_APPLY_FAILED,
-                error_message=f"Terraform init/apply failed for {app_name}: {e}",
+                error_code=UpgradeErrorCode.METADATA_INVALID,
+                error_message=f"No deployed application found for charm {charm_name}",
             )
 
         try:
-            self.jhelper.wait_until_desired_status(
-                OPENSTACK_MODEL,
-                [app_name],
-                status=["active"],
-                timeout=600,
+            with console.status(f"  {charm_name}: applying terraform plan..."):
+                self.tfhelper.init()
+                self.tfhelper.update_partial_tfvars_and_apply_tf(
+                    client,
+                    self.manifest,
+                    [charm_name],
+                    OPENSTACK_CONFIG_KEY,
+                    tf_apply_extra_args=target_args,
+                )
+        except TerraformException as e:
+            click.echo(f"  {charm_name}: terraform apply FAILED")
+            return PhaseResult(
+                success=False,
+                error_code=UpgradeErrorCode.CONTROL_PLANE_APPLY_FAILED,
+                error_message=f"Terraform init/apply failed for {charm_name}: {e}",
             )
+
+        try:
+            with console.status(f"  {charm_name}: waiting for convergence..."):
+                self.jhelper.wait_until_desired_status(
+                    OPENSTACK_MODEL,
+                    juju_app_names,
+                    status=["active"],
+                    timeout=600,
+                )
         except (JujuWaitException, TimeoutError) as e:
+            click.echo(f"  {charm_name}: convergence timeout")
             return PhaseResult(
                 success=False,
                 error_code=UpgradeErrorCode.CONTROL_PLANE_CONVERGENCE_TIMEOUT,
-                error_message=f"{app_name} did not converge: {e}",
+                error_message=f"{charm_name} did not converge: {e}",
             )
+
+        # If this was the only app in the group, mark group as completed
+        if len(group_meta.apps) == 1:
+            group_state.status = PhaseStatus.COMPLETED
+            group_state.completed_at = _now_iso()
+            coordinator.persist_state()
+        click.echo(f"  {charm_name}: completed")
 
         return PhaseResult(success=True)
 
@@ -362,14 +473,22 @@ class ControlPlaneHandler:
             group_meta.ready_timeout_sec,
         )
 
-        # Resolve charm names to deployed app names for Juju operations
+        # Resolve charm names to deployed app names, skipping undeployed charms
         status = self.jhelper.get_model_status(OPENSTACK_MODEL)
+        deployed_charms = {app.charm for app in status.apps.values()}
+        charms = [c for c in charms if c in deployed_charms]
         app_names = [name for name, app in status.apps.items() if app.charm in charms]
+        if not charms:
+            LOG.info("group %s has no deployed charms — skipping", group_name)
+            click.echo(f"  {group_name}: no deployed charms — skipping")
+            return PhaseResult(success=True)
         LOG.info("resolved charms %s to apps %s", charms, app_names)
 
         # Pre-upgrade actions (use app names, not charm names)
-        pre_result = run_pre_actions(self.jhelper, group_meta.pre_actions)
+        with console.status(f"  {group_name}: running pre-upgrade actions..."):
+            pre_result = run_pre_actions(self.jhelper, group_meta.pre_actions)
         if not pre_result.success:
+            click.echo(f"  {group_name}: pre-upgrade actions FAILED")
             # Still run post-actions as cleanup attempt
             run_post_actions(self.jhelper, group_meta.post_actions)
             return pre_result
@@ -379,19 +498,22 @@ class ControlPlaneHandler:
             charms, group_meta.terraform_targets
         )
 
+        self._override_charm_manifests(charms)
         try:
             # ponytail: init re-resolves providers from the snap mirror; a snap
             # refresh can bump the juju provider version, leaving the .terraform
             # dir stale and apply failing with "unavailable provider".
-            self.tfhelper.init()
-            self.tfhelper.update_partial_tfvars_and_apply_tf(
-                client,
-                self.manifest,
-                charms,
-                OPENSTACK_CONFIG_KEY,
-                tf_apply_extra_args=target_args,
-            )
+            with console.status(f"  {group_name}: applying terraform plan..."):
+                self.tfhelper.init()
+                self.tfhelper.update_partial_tfvars_and_apply_tf(
+                    client,
+                    self.manifest,
+                    charms,
+                    OPENSTACK_CONFIG_KEY,
+                    tf_apply_extra_args=target_args,
+                )
         except TerraformException as e:
+            click.echo(f"  {group_name}: terraform apply FAILED")
             # Run post-actions as cleanup even on failure
             run_post_actions(self.jhelper, group_meta.post_actions)
             return PhaseResult(
@@ -401,13 +523,18 @@ class ControlPlaneHandler:
             )
 
         try:
-            self.jhelper.wait_until_desired_status(
-                OPENSTACK_MODEL,
-                app_names,
-                status=["active"],
-                timeout=group_meta.ready_timeout_sec,
-            )
+            with console.status(
+                f"  {group_name}: waiting for convergence "
+                f"({group_meta.ready_timeout_sec}s)..."
+            ):
+                self.jhelper.wait_until_desired_status(
+                    OPENSTACK_MODEL,
+                    app_names,
+                    status=["active"],
+                    timeout=group_meta.ready_timeout_sec,
+                )
         except (JujuWaitException, TimeoutError) as e:
+            click.echo(f"  {group_name}: convergence timeout")
             # Run post-actions as cleanup even on failure
             run_post_actions(self.jhelper, group_meta.post_actions)
             return PhaseResult(
@@ -420,10 +547,10 @@ class ControlPlaneHandler:
             )
 
         # Post-upgrade actions
-        post_result = run_post_actions(self.jhelper, group_meta.post_actions)
+        with console.status(f"  {group_name}: running post-upgrade actions..."):
+            post_result = run_post_actions(self.jhelper, group_meta.post_actions)
         if not post_result.success:
-            # Group upgraded successfully but post-action failed —
-            # healthcheck may not be restored. Mark blocked.
+            click.echo(f"  {group_name}: post-upgrade actions FAILED")
             return PhaseResult(
                 success=False,
                 error_code=UpgradeErrorCode.CONTROL_PLANE_ACTION_FAILED,
@@ -435,4 +562,5 @@ class ControlPlaneHandler:
                 ),
             )
 
+        click.echo(f"  {group_name}: completed")
         return PhaseResult(success=True)

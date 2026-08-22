@@ -116,6 +116,16 @@ def mock_deployment():
     deployment.get_manifest.return_value = manifest
     deployment.get_juju_helper.return_value = jhelper
     deployment.get_client.return_value = client
+
+    # Set up model status with apps matching metadata charm names
+    status = MagicMock()
+    keystone_app = MagicMock()
+    keystone_app.charm = "keystone-k8s"
+    glance_app = MagicMock()
+    glance_app.charm = "glance-k8s"
+    status.apps = {"keystone": keystone_app, "glance": glance_app}
+    jhelper.get_model_status.return_value = status
+
     return deployment
 
 
@@ -306,11 +316,22 @@ class TestControlPlaneHandler:
         metadata = _make_metadata()
         handler = ControlPlaneHandler(mock_deployment)
 
+        # Mock juju status: app "keystone" has charm "keystone-k8s"
+        jhelper = mock_deployment.get_juju_helper.return_value
+        status = MagicMock()
+        keystone_app = MagicMock()
+        keystone_app.charm = "keystone-k8s"
+        status.apps = {"keystone": keystone_app}
+        jhelper.get_model_status.return_value = status
+
         handler.run_application(coordinator, metadata, "keystone-k8s")
 
         tfhelper = mock_deployment.get_tfhelper.return_value
         call = tfhelper.update_partial_tfvars_and_apply_tf.call_args
         assert call.kwargs["tf_apply_extra_args"] == ["-target=module.keystone"]
+        # Verify juju wait uses the app name, not the charm name
+        wait_call = jhelper.wait_until_desired_status.call_args
+        assert wait_call.args[1] == ["keystone"]
 
     def test_plan_group_passes_target_args(self, mock_deployment):
         """Verify -target args are passed to terraform plan in dry-run."""
