@@ -201,6 +201,12 @@ class ControlPlaneHandler:
 
         control_plane = hop.phases.control_plane
 
+        # Set phase status on first group start
+        if control_plane.status == PhaseStatus.PENDING:
+            control_plane.status = PhaseStatus.IN_PROGRESS
+            hop.phase = "control_plane"
+            coordinator.persist_state()
+
         for group_meta in metadata.control_plane_groups:
             group_name = group_meta.name
 
@@ -233,6 +239,10 @@ class ControlPlaneHandler:
                 coordinator.persist_state()
                 LOG.warning("group %s failed: %s", group_name, result.error_message)
                 return result
+
+        # All groups done — mark phase completed
+        control_plane.status = PhaseStatus.COMPLETED
+        coordinator.persist_state()
 
         return PhaseResult(success=True)
 
@@ -329,6 +339,12 @@ class ControlPlaneHandler:
             group_state = Group()
             control_plane.groups[group_name] = group_state
 
+        # Set phase status on first group start
+        if control_plane.status == PhaseStatus.PENDING:
+            control_plane.status = PhaseStatus.IN_PROGRESS
+            hop.phase = "control_plane"
+            coordinator.persist_state()
+
         group_state.status = PhaseStatus.IN_PROGRESS
         group_state.started_at = _now_iso()
         coordinator.persist_state()
@@ -337,6 +353,17 @@ class ControlPlaneHandler:
         if result.success:
             group_state.status = PhaseStatus.COMPLETED
             group_state.completed_at = _now_iso()
+
+            # If this was the last group in the metadata and all groups
+            # completed, mark phase completed
+            all_completed = all(
+                gs.status == PhaseStatus.COMPLETED
+                for gs in control_plane.groups.values()
+            )
+            is_last = group_name == metadata.control_plane_groups[-1].name
+            if is_last and all_completed:
+                control_plane.status = PhaseStatus.COMPLETED
+                coordinator.persist_state()
         else:
             group_state.status = PhaseStatus.FAILED
             group_state.last_error = LastError(
@@ -398,6 +425,12 @@ class ControlPlaneHandler:
             group_state.started_at = _now_iso()
             coordinator.persist_state()
 
+        # Set phase status on first app start
+        if control_plane.status == PhaseStatus.PENDING:
+            control_plane.status = PhaseStatus.IN_PROGRESS
+            hop.phase = "control_plane"
+            coordinator.persist_state()
+
         client = self.deployment.get_client()
         target_args = _terraform_targets_for_charms(
             [charm_name], group_meta.terraform_targets
@@ -455,6 +488,18 @@ class ControlPlaneHandler:
             group_state.status = PhaseStatus.COMPLETED
             group_state.completed_at = _now_iso()
             coordinator.persist_state()
+
+            # If this was the last group in the metadata and all groups
+            # completed, mark phase completed
+            all_completed = all(
+                gs.status == PhaseStatus.COMPLETED
+                for gs in control_plane.groups.values()
+            )
+            is_last = group_meta.name == metadata.control_plane_groups[-1].name
+            if is_last and all_completed:
+                control_plane.status = PhaseStatus.COMPLETED
+                coordinator.persist_state()
+
         click.echo(f"  {charm_name}: completed")
 
         return PhaseResult(success=True)

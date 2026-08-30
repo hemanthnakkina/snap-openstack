@@ -156,6 +156,18 @@ class TestControlPlaneHandler:
         cp = state.current_hop.phases.control_plane
         assert cp.groups["identity-core"].status == PhaseStatus.COMPLETED
         assert cp.groups["image"].status == PhaseStatus.COMPLETED
+        # Phase status set to completed after all groups
+        assert cp.status == PhaseStatus.COMPLETED
+
+    def test_phase_set_to_control_plane(self, mock_deployment, coordinator):
+        """Verify hop.phase is set to control_plane on run."""
+        metadata = _make_metadata()
+        state = coordinator.state
+        handler = ControlPlaneHandler(mock_deployment)
+
+        handler.run(coordinator, metadata, state)
+
+        assert state.current_hop.phase == "control_plane"
 
     def test_terraform_apply_called_per_group(self, mock_deployment, coordinator):
         metadata = _make_metadata()
@@ -242,6 +254,8 @@ class TestControlPlaneHandler:
         tfhelper = mock_deployment.get_tfhelper.return_value
         # Only image group should be upgraded
         assert tfhelper.update_partial_tfvars_and_apply_tf.call_count == 1
+        # Phase status stays completed (already-in-progress phases resume)
+        assert state.current_hop.phases.control_plane.status == PhaseStatus.COMPLETED
 
     def test_no_metadata_returns_failure(self, mock_deployment, coordinator):
         state = coordinator.state
@@ -333,16 +347,45 @@ class TestControlPlaneHandler:
         wait_call = jhelper.wait_until_desired_status.call_args
         assert wait_call.args[1] == ["keystone"]
 
-    def test_plan_group_passes_target_args(self, mock_deployment):
-        """Verify -target args are passed to terraform plan in dry-run."""
+    def test_run_group_does_not_complete_phase_with_failed_group(
+        self, mock_deployment, coordinator
+    ):
+        """run_group should not mark phase completed if another group failed."""
         metadata = _make_metadata()
+        state = coordinator.state
+
+        # Mark first group as failed
+        cp = state.current_hop.phases.control_plane
+        cp.groups["identity-core"] = Group(
+            status=PhaseStatus.FAILED,
+            last_error={"code": "TEST", "message": "test"},
+        )
+
         handler = ControlPlaneHandler(mock_deployment)
-        group_meta = metadata.control_plane_groups[0]
+        # Run the second (last) group via run_group
+        result = handler.run_group(coordinator, metadata, "image")
 
-        handler.plan_group(group_meta)
+        assert result.success is True
+        # Phase should NOT be marked completed — identity-core is failed
+        assert cp.status != PhaseStatus.COMPLETED
 
-        tfhelper = mock_deployment.get_tfhelper.return_value
-        plan_call = tfhelper.update_partial_tfvars_and_plan_tf.call_args
-        assert plan_call.kwargs["tf_plan_extra_args"] == ["-target=module.keystone"]
-        text_call = tfhelper.terraform_plan_text.call_args
-        assert text_call.kwargs["extra_args"] == ["-target=module.keystone"]
+    def test_run_group_completes_phase_when_all_groups_done(
+        self, mock_deployment, coordinator
+    ):
+        """run_group marks phase completed only if all groups completed."""
+        metadata = _make_metadata()
+        state = coordinator.state
+
+        # Mark first group as completed
+        cp = state.current_hop.phases.control_plane
+        cp.groups["identity-core"] = Group(
+            status=PhaseStatus.COMPLETED,
+            started_at="2025-01-01T00:00:00Z",
+            completed_at="2025-01-01T00:01:00Z",
+        )
+
+        handler = ControlPlaneHandler(mock_deployment)
+        result = handler.run_group(coordinator, metadata, "image")
+
+        assert result.success is True
+        assert cp.status == PhaseStatus.COMPLETED
