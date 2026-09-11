@@ -566,6 +566,32 @@ class FeatureRequirement(Requirement):
             )
         return klass
 
+    @property
+    def group(self) -> typing.Optional[Type["BaseFeatureGroup"]]:
+        """Return the feature group class if the requirement names a group."""
+        return groups().get(self.name)
+
+    @property
+    def feature_klasses(self) -> list[Type["EnableDisableFeature"]]:
+        """Return the feature classes satisfying this requirement.
+
+        A requirement naming a group (e.g. observability) is satisfied by
+        any one of the group's features, which are mutually exclusive
+        providers of the same functionality.
+        """
+        if group := self.group:
+            klasses = [
+                klass
+                for klass in features().values()
+                if klass.group is group and issubclass(klass, EnableDisableFeature)
+            ]
+            if not klasses:
+                raise InvalidRequirementError(
+                    f"Feature group {self.name} has no enable/disable features"
+                )
+            return klasses
+        return [self.klass]
+
 
 @typing.runtime_checkable
 class NamedEnabledDisableFeatureProtocol(typing.Protocol):
@@ -705,7 +731,9 @@ class EnableDisableFeature(BaseFeature, Generic[ConfigType]):
             if not feature.is_enabled(deployment.get_client()):
                 continue
             for requirement in feature.requires:
-                if requirement.name != self.name:
+                if requirement.name != self.name and not (
+                    requirement.group is not None and self.group is requirement.group
+                ):
                     continue
                 if state == "disable":
                     raise HasRequirersFeaturesError(
@@ -724,6 +752,27 @@ class EnableDisableFeature(BaseFeature, Generic[ConfigType]):
     def enable_requirements(self, deployment: Deployment, show_hints: bool):
         """Iterate through requirements, enable features if possible."""
         for requirement in self.requires:
+            if group := requirement.group:
+                # Requirement names a group of mutually exclusive features
+                # (e.g. observability embedded or external): satisfied if any
+                # member is enabled, never auto-enabled since the user has
+                # to choose the provider.
+                klasses = [
+                    klass
+                    for klass in requirement.feature_klasses
+                    if issubclass(klass, EnableDisableFeature)
+                ]
+                if any(
+                    klass().is_enabled(deployment.get_client()) for klass in klasses
+                ):
+                    continue
+                if requirement.optional:
+                    continue
+                members = ", ".join(f"'{klass().name}'" for klass in klasses)
+                raise FeatureError(
+                    f"Feature {self.name} requires the {group.name} feature"
+                    f" to be enabled. Enable one of {members} and retry."
+                )
             if not issubclass(requirement.klass, EnableDisableFeature):
                 LOG.debug(
                     "Skipping %s as it is not of type EnableDisableFeature",
