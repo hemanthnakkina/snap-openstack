@@ -13,6 +13,7 @@ from sunbeam.core.manifest import FeatureManifest, Manifest
 from sunbeam.feature_manager import FeatureManager
 from sunbeam.features.interface.v1.base import (
     BaseFeature,
+    BaseFeatureGroup,
     EnableDisableFeature,
     FeatureError,
     FeatureRequirement,
@@ -308,6 +309,27 @@ def feature_klass(version_: str, enabled: bool = False) -> type[EnableDisableFea
             pass
 
     return CompatibleFeature
+
+
+def test_requirement_feature_group():
+    class TestFeatureGroup(BaseFeatureGroup):
+        name = "test_requirement_group"
+
+    class TestFeatureA(EnableDisableFeature):
+        name = "test_requirement_group.a"
+        group = TestFeatureGroup
+
+    class TestFeatureB(EnableDisableFeature):
+        name = "test_requirement_group.b"
+        group = TestFeatureGroup
+
+    requirement = FeatureRequirement("test_requirement_group")
+
+    assert requirement.group is TestFeatureGroup
+    assert {feature.name for feature in requirement.feature_klasses} == {
+        TestFeatureA.name,
+        TestFeatureB.name,
+    }
 
 
 class TestEnableDisableFeature:
