@@ -737,7 +737,7 @@ class EnableDisableFeature(BaseFeature, Generic[ConfigType]):
                     continue
                 if state == "disable":
                     raise HasRequirersFeaturesError(
-                        f"{feature.name} is enabled and requires {self.name}"
+                        f"{feature.name} is enabled and requires {requirement.name}"
                     )
                 message = (
                     f"Feature {feature.name} is enabled and "
@@ -757,14 +757,23 @@ class EnableDisableFeature(BaseFeature, Generic[ConfigType]):
                 # (e.g. observability embedded or external): satisfied if any
                 # member is enabled, never auto-enabled since the user has
                 # to choose the provider.
-                klasses = [
-                    klass
-                    for klass in requirement.feature_klasses
-                    if issubclass(klass, EnableDisableFeature)
-                ]
-                if any(
-                    klass().is_enabled(deployment.get_client()) for klass in klasses
-                ):
+                klasses = requirement.feature_klasses
+                enabled_klass = next(
+                    (
+                        klass
+                        for klass in klasses
+                        if klass().is_enabled(deployment.get_client())
+                    ),
+                    None,
+                )
+                if enabled_klass is not None:
+                    # Enforce the version specifier on the enabled member
+                    self.check_enabled_requirement_is_compatible(
+                        deployment,
+                        FeatureRequirement(
+                            f"{enabled_klass().name}{requirement.specifier}"
+                        ),
+                    )
                     continue
                 if requirement.optional:
                     continue
